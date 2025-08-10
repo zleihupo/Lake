@@ -14,94 +14,153 @@ Original file is located at
 from google.colab import drive
 drive.mount('/content/drive')
 
-# ========= IMPORTS =========
 import os
+import re
 import numpy as np
 import rasterio
-import matplotlib.pyplot as plt
+from PIL import Image
 from tqdm import tqdm
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
-from datetime import datetime
 
-# ========= 设置参数 =========
-# 根目录（包含7500个子文件夹）
-root_folder = "/content/drive/My Drive/lake100_orignal"
-# 日志文件路径
-log_file_path = os.path.join(root_folder, "processing_log.txt")
-# 每批处理多少个文件夹（建议 500–1000）
-batch_size = 1000
-# 同时处理几个（线程数，建议 ≤4）
-max_threads = 3
+# ========== 参数设置 ==========
+input_root = "/content/drive/MyDrive/lake100_orignal"
+output_root = "/content/drive/MyDrive/image"
+os.makedirs(output_root, exist_ok=True)
 
-# ========= 初始化日志 =========
-with open(log_file_path, "w") as log_file:
-    log_file.write(f"📘 中值合成处理日志 - {datetime.now()}\n\n")
+batch_size = 200
+max_workers = 2
 
-# ========= 查找所有含 .tif 文件的子文件夹 =========
-all_folders = []
-for root, dirs, files in os.walk(root_folder):
-    if any(f.endswith(".tif") for f in files):
-        all_folders.append(root)
+# ========== 图像评分函数（增强版） ==========
+# 最终严格版 image_score 函数
 
-print(f"📂 共发现 {len(all_folders)} 个可处理的子文件夹")
 
-# ========= 单个文件夹处理逻辑 =========
-def process_folder(tif_folder):
+def image_score(img):
+    # Step 0: 检查通道和尺寸
+    if img.shape[0] < 3 or img.shape[1] == 0 or img.shape[2] == 0:
+        return -1, "❌ 图像通道不足或尺寸为0"
+
+    # Step 1: 检查是否含 NaN（可能来自损坏图像）
+    if np.isnan(img).any():
+        return -1, "❌ 图像包含 NaN"
+
+    # Step 2: 预处理
+    r = img[0].astype(np.float32)
+    g = img[1].astype(np.float32)
+    b = img[2].astype(np.float32)
+    brightness = (r + g + b) / 3
+    h, w = brightness.shape
+
+    # Step 3: 中心区域检测
+    ch, cw = h // 4, w // 4
+    center_r = r[ch:3 * ch, cw:3 * cw]
+    center_g = g[ch:3 * ch, cw:3 * cw]
+    center_b = b[ch:3 * ch, cw:3 * cw]
+    center_brightness = (center_r + center_g + center_b) / 3
+
+    center_mean = np.mean(center_brightness)
+    center_std = np.std(center_brightness)
+
+
+    # Step 5: 云检测（灰白区域）
+    grayish = (np.abs(r - g) < 25) & (np.abs(r - b) < 25) & (np.abs(g - b) < 25)
+    cloud_mask = (brightness > 220) & grayish
+    cloud_ratio = np.sum(cloud_mask) / brightness.size
+
+    # Step 6: 白像素比例（强反射区域）
+    white_ratio = np.sum(brightness > 245) / brightness.size
+
+    # Step 7: 黑像素比例（缺失图）
+    black_ratio = np.sum(brightness < 10) / brightness.size
+
+    # Step 8: 图像完整性过滤
+    if center_mean < 30:
+        return -1, "中心亮度太低"
+    if center_std < 5:
+        return -1, "中心区域对比度太低"
+    if black_ratio > 0.2:
+        return -1, "黑像素过多"
+    if np.max(brightness) < 50:
+        return -1, "整体亮度不足"
+
+    # Step 9: 综合评分（越小越优）
+    score = cloud_ratio + 0.5 * white_ratio
+    return -score, "✅ 合格"
+
+
+
+# ========== 处理单个文件夹 ==========
+def process_folder(folder):
     try:
-        # 跳过已处理的
-        output_path = os.path.join(tif_folder, "median_composite.png")
-        if os.path.exists(output_path):
-            return f"✅ 已存在跳过: {tif_folder}"
-
-        tif_files = [os.path.join(tif_folder, f) for f in os.listdir(tif_folder) if f.endswith(".tif")]
+        tif_files = [f for f in os.listdir(folder) if f.lower().endswith(".tif")]
         if not tif_files:
-            return f"⚠️ 无 .tif 文件跳过: {tif_folder}"
+            return f"⚠️ 无图像: {folder}"
 
-        with rasterio.open(tif_files[0]) as src:
-            band_count = src.count
+        best_score = float("-inf")
+        best_img = None
+        best_reason = ""
 
-        stack = []
-        for tif in tif_files:
-            with rasterio.open(tif) as src:
-                img = src.read().astype(np.float32)
-                stack.append(img)
+        for tif_name in tif_files:
+            tif_path = os.path.join(folder, tif_name)
+            with rasterio.open(tif_path) as src:
+                img = src.read()
+                if img.shape[0] < 3 or img.shape[1] == 0 or img.shape[2] == 0:
+                    continue
 
-        stack = np.stack(stack, axis=0)
-        median_composite = np.median(stack, axis=0)
+                score, reason = image_score(img)
+                if score > best_score:
+                    best_score = score
+                    best_img = img
+                    best_reason = reason
 
-        rgb = median_composite[:3]
-        rgb = rgb / np.max(rgb)
-        rgb = np.clip(rgb, 0, 1)
-        rgb_img = np.transpose(rgb, (1, 2, 0))
+        if best_img is None or best_score == -1:
+            return f"⚠️ 无有效图像: {folder}（原因：{best_reason}）"
 
-        plt.imsave(output_path, rgb_img)
+        rgb = best_img[:3].astype(np.uint8)
+        rgb = np.transpose(rgb, (1, 2, 0))
+        img_pil = Image.fromarray(rgb)
 
-        # 内存清理
-        del stack, median_composite, rgb, rgb_img
+        folder_name = os.path.basename(folder)
+        match = re.match(r"(.*)-(\d{2})-(\d{2})", folder_name)
+        if match:
+            lake, year, month = match.groups()
+        else:
+            return f"⚠️ 无法解析: {folder_name}"
+
+        filename = f"{lake}_{year}_{month}_img.png"
+        out_path = os.path.join(output_root, filename)
+        img_pil.save(out_path)
+
+        del best_img, rgb, img_pil
         gc.collect()
-        plt.close("all")
-
-        return f"✅ 成功处理: {tif_folder}"
+        return f"✅ 保存: {filename}（评分: {best_score:.3f}）"
 
     except Exception as e:
-        return f"❌ 处理失败: {tif_folder}\n错误: {str(e)}"
+        return f"❌ 错误: {folder}\n{e}"
 
-# ========= 分批并行处理 =========
-def process_in_batches(folders, batch_size=1000, max_threads=3):
-    total = len(folders)
-    for start in range(0, total, batch_size):
-        batch = folders[start:start + batch_size]
-        print(f"\n🚀 正在处理第 {start//batch_size + 1} 批（共 {len(batch)} 个文件夹）")
+# ========== 分批执行 ==========
+total = len(all_folders)
+print(f"📂 共需处理 {total} 个文件夹，每批 {batch_size} 个")
 
-        with ThreadPoolExecutor(max_workers=max_threads) as executor, open(log_file_path, "a") as log_file:
-            futures = {executor.submit(process_folder, folder): folder for folder in batch}
-            for future in tqdm(as_completed(futures), total=len(futures), desc="处理进度"):
-                result = future.result()
-                print(result)
-                log_file.write(result + "\n")
+start_all = time.time()
 
-# ========= 启动处理 =========
-process_in_batches(all_folders, batch_size=batch_size, max_threads=max_threads)
-print(f"\n🎉 所有批次处理完毕，日志保存于：{log_file_path}")
+for i in range(0, total, batch_size):
+    batch = all_folders[i:i + batch_size]
+    print(f"\n🚀 开始第 {i//batch_size + 1} 批，共 {len(batch)} 个")
+
+    start_batch = time.time()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_folder, folder): folder for folder in batch}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="📷 处理中"):
+            result = future.result()
+            print(result)
+            with open("image_selection_log.txt", "a") as log:
+                log.write(result + "\n")
+
+    print(f"✅ 当前批次耗时：{(time.time() - start_batch):.2f} 秒")
+
+print(f"\n🎉 全部处理完成，总耗时：{(time.time() - start_all)/60:.2f} 分钟")
+
 
