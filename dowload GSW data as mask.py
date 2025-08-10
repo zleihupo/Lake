@@ -182,3 +182,28 @@ with open(INDEX_CSV, mode='w', newline='') as csvfile:
 
 print("🎉 所有批次任务提交完毕。你可以在 Earth Engine Task 面板查看进度。\n导出图像将自动保存到你的 Google Drive → 'GSW_MonthlyHistory/<湖泊名>/<年份>/' 文件夹中。\n📄 索引 CSV 文件已生成：gsw_export_index.csv")
 
+# ✅ 掩膜提取函数
+def convert_to_mask_png_if_water(in_path, out_path):
+    with rasterio.open(in_path) as src:
+        image = src.read(1)
+
+    # 判断是否含水体像素
+    has_water = np.any((image == 254) | (image == 2) | (np.isclose(image, 2.0)))
+    if not has_water:
+        print(f"⚠️ 无水体像素，跳过: {os.path.basename(in_path)}")
+        return False
+
+    mask = np.where((image == 254) | (image == 2) | (np.isclose(image, 2.0)), 255, 0).astype(np.uint8)
+    Image.fromarray(mask).save(out_path)
+    return True
+converted = 0
+for folder, file in tqdm(tif_files):
+    in_path = os.path.join(folder, file)
+    base_name = os.path.splitext(file)[0]
+    out_path = os.path.join(output_root, base_name + "_mask.png")
+    try:
+        if convert_to_mask_png_if_water(in_path, out_path):
+            converted += 1
+    except Exception as e:
+        print(f"❌ 失败：{file} → {e}")
+print("✅ 所有 PNG 掩膜图生成完成，已保存到单个 mask 文件夹中！")
